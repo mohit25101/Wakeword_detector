@@ -6,3 +6,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# ESP-IDF generated files
+build/
+sdkconfig.old
+
+# Local backups
+*.bak
