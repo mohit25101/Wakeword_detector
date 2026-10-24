@@ -1,0 +1,203 @@
+#include "esp_timer.h"
+#include "esp_check.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_log.h"
+#include "esp_err.h"
+#include "driver/i2s_std.h"
+
+#include "edge-impulse-sdk/classifier/ei_run_classifier.h"
+#include "model-parameters/model_metadata.h"
+
+#define MIC_BCLK GPIO_NUM_41
+#define MIC_WS   GPIO_NUM_42
+#define MIC_DIN  GPIO_NUM_2
+
+static const char *TAG = "WAKE_WORD";
+static float audio_slice[EI_CLASSIFIER_SLICE_SIZE];
+static i2s_chan_handle_t rx_chan = nullptr;
+static int32_t *mic_buffer = nullptr;
+
+// Convert one microphone slice to the float samples expected by Edge Impulse.
+static int get_signal_data(size_t offset, size_t length, float *out_ptr)
+{
+    (void)offset;
+
+    size_t bytes_read = 0;
+    const size_t bytes_needed = length * sizeof(int32_t);
+
+    
+
+esp_err_t err = i2s_channel_read(
+    rx_chan, mic_buffer, bytes_needed, &bytes_read, portMAX_DELAY
+);
+
+
+
+    if (err != ESP_OK || bytes_read != bytes_needed) {
+        ESP_LOGE(TAG, "I2S read failed: err=%s, bytes=%u/%u",
+                 esp_err_to_name(err),
+                 (unsigned)bytes_read,
+                 (unsigned)bytes_needed);
+        return -1;
+    }
+
+    for (size_t i = 0; i < length; i++) {
+        // Typical 24-bit I2S microphone samples are left-aligned
+        // in the 32-bit slot. Start with the upper 16 bits.
+        int16_t sample = (int16_t)(mic_buffer[i] >> 16);
+        out_ptr[i] = (float)sample;
+    }
+
+    return EIDSP_OK;
+}
+
+static esp_err_t init_microphone(void)
+{
+    i2s_chan_config_t chan_cfg = {};
+chan_cfg.id = I2S_NUM_AUTO;
+chan_cfg.role = I2S_ROLE_MASTER;
+chan_cfg.dma_desc_num = 6;
+chan_cfg.dma_frame_num = 256;
+chan_cfg.auto_clear = true;
+chan_cfg.intr_priority = 0;
+chan_cfg.allow_pd = false;
+
+    ESP_RETURN_ON_ERROR(
+        i2s_new_channel(&chan_cfg, nullptr, &rx_chan),
+        TAG, "Create I2S channel failed"
+    );
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(EI_CLASSIFIER_FREQUENCY),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_32BIT,
+            I2S_SLOT_MODE_MONO
+        ),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = MIC_BCLK,
+            .ws = MIC_WS,
+            .dout = I2S_GPIO_UNUSED,
+            .din = MIC_DIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+    ESP_RETURN_ON_ERROR(
+        i2s_channel_init_std_mode(rx_chan, &std_cfg),
+        TAG, "Initialize I2S mode failed"
+    );
+
+    ESP_RETURN_ON_ERROR(
+        i2s_channel_enable(rx_chan),
+        TAG, "Enable I2S channel failed"
+    );
+
+    return ESP_OK;
+}
+
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting ESP32-S3-EYE wake-word detector");
+    ESP_LOGI(TAG, "Sample rate: %d Hz", EI_CLASSIFIER_FREQUENCY);
+    ESP_LOGI(TAG, "Full window: %d samples",
+             EI_CLASSIFIER_RAW_SAMPLE_COUNT);
+    ESP_LOGI(TAG, "Samples per classifier call: %d",
+             EI_CLASSIFIER_SLICE_SIZE);
+
+    if (init_microphone() != ESP_OK) {
+        ESP_LOGE(TAG, "Microphone initialization failed");
+        return;
+    }
+
+    // The I2S buffer stores one 32-bit sample per microphone sample.
+    mic_buffer = static_cast<int32_t *>(
+        malloc(EI_CLASSIFIER_SLICE_SIZE * sizeof(int32_t))
+    );
+
+    if (mic_buffer == nullptr) {
+        ESP_LOGE(TAG, "Could not allocate microphone buffer");
+        return;
+    }
+
+    run_classifier_init();
+
+    signal_t signal = {};
+    signal.get_data = &get_signal_data;
+    signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
+
+    ESP_LOGI(TAG, "Listening for helloworld...");
+
+    
+    while (true) {
+    ei_impulse_result_t result = {};
+
+    // Start timing before classifier inference
+    int64_t inference_start = esp_timer_get_time();
+
+    EI_IMPULSE_ERROR err = run_classifier_continuous(
+        &signal, &result, false
+    );
+
+    // Calculate elapsed time after inference completes
+    int64_t inference_us = esp_timer_get_time() - inference_start;
+
+    ESP_LOGI(TAG, "Classifier call: %lld ms",
+             (long long)(inference_us / 1000));
+ESP_LOGI(TAG, "DSP time: %d ms",
+         (int)result.timing.dsp);
+
+ESP_LOGI(TAG, "Classification time: %d ms",
+         (int)result.timing.classification);
+
+    if (err != EI_IMPULSE_OK) {
+        ESP_LOGE(TAG, "Classifier failed: %d", (int)err);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+    }
+
+    // Keep the rest of your existing code here:
+    // classification scores and HELLOWORLD detection
+
+        float helloworld_score = 0.0f;
+
+        for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+            ESP_LOGI(TAG, "%s: %.3f",
+                     result.classification[i].label,
+                     result.classification[i].value);
+
+            if (strcmp(result.classification[i].label, "helloworld") == 0) {
+                helloworld_score = result.classification[i].value;
+            }
+        }
+
+        // Trigger once when the score crosses the threshold.
+        static bool wake_word_active = false;
+        const float threshold = 0.80f;
+
+        if (helloworld_score >= threshold && !wake_word_active) {
+            ESP_LOGW(TAG, "HELLOWORLD DETECTED");
+            wake_word_active = true;
+        } else if (helloworld_score < 0.50f) {
+            // Rearm after the score falls.
+            wake_word_active = false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+
+}
